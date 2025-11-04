@@ -11,6 +11,11 @@ const HDR_TURNCHUNK_PART = 0x02;
 const BUFFERED_AMOUNT_LIMIT = 256 * 1024;
 const EMPTY_ROOM_CHECK_INTERVAL = 600 * 1000;
 
+// Anti-desync: message queue settings
+const MAX_QUEUE_SIZE = 100;
+const QUEUE_PROCESS_INTERVAL = 50;
+const MAX_QUEUE_OVERFLOW_COUNT = 10;
+
 const ALLOWED_RE = /^[\p{L}\p{N}._-]+$/u;
 
 const rooms = new Map();
@@ -208,35 +213,144 @@ const handlers = {
   }
 };
 
+// ---- message queue (anti-desync) ----
+function enqueueMessage(ws, buffer, priority = false) {
+  if (!ws || !ws.state || !ws.state.messageQueue) return false;
+  
+  // Check queue size
+  if (ws.state.messageQueue.length >= MAX_QUEUE_SIZE) {
+    ws.state.queueOverflowCount = (ws.state.queueOverflowCount || 0) + 1;
+    
+    // If queue overflows too many times, disconnect the client
+    if (ws.state.queueOverflowCount >= MAX_QUEUE_OVERFLOW_COUNT) {
+      console.log(`Client ${ws.state.player} disconnected due to queue overflow`);
+      handleLeave(ws, ws.state);
+      ws.terminate();
+      return false;
+    }
+    return false;
+  }
+  
+  // Add to queue (priority messages go to the front)
+  if (priority) {
+    ws.state.messageQueue.unshift(buffer);
+  } else {
+    ws.state.messageQueue.push(buffer);
+  }
+  
+  // Try to process queue immediately
+  processClientQueue(ws);
+  return true;
+}
+
+function processClientQueue(ws) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!ws.state || !ws.state.messageQueue) return;
+  if (ws.state.isSending) return; // Already sending
+  if (ws.state.messageQueue.length === 0) return;
+  
+  // Check if we can send
+  if (ws.bufferedAmount > BUFFERED_AMOUNT_LIMIT) return;
+  
+  ws.state.isSending = true;
+  
+  try {
+    // Send as many messages as possible
+    while (ws.state.messageQueue.length > 0 && ws.bufferedAmount <= BUFFERED_AMOUNT_LIMIT) {
+      const buffer = ws.state.messageQueue.shift();
+      ws.send(buffer, { binary: true });
+      
+      // Reset overflow counter on successful send
+      ws.state.queueOverflowCount = 0;
+    }
+  } catch (err) {
+    // Error sending, will retry later
+  } finally {
+    ws.state.isSending = false;
+  }
+}
+
 // ---- sending ----
-function safeSend(ws, arr) {
+function safeSend(ws, arr, useQueue = false) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   if (!Array.isArray(arr)) return;
-  if (ws.bufferedAmount > BUFFERED_AMOUNT_LIMIT) return;
+  
   try {
     const payload = Buffer.from(encode(arr));
     const framed = Buffer.concat([Buffer.from([HDR_CONTROL]), payload]);
+    
+    // If queue is enabled and client has pending messages or high buffer, use queue
+    if (useQueue && ws.state && ws.state.messageQueue) {
+      if (ws.state.messageQueue.length > 0 || ws.bufferedAmount > BUFFERED_AMOUNT_LIMIT) {
+        return enqueueMessage(ws, framed);
+      }
+    }
+    
+    // Direct send if buffer is okay
+    if (ws.bufferedAmount > BUFFERED_AMOUNT_LIMIT) {
+      if (useQueue && ws.state && ws.state.messageQueue) {
+        return enqueueMessage(ws, framed);
+      }
+      return;
+    }
+    
     ws.send(framed, { binary: true });
-  } catch (err) {}
+  } catch (err) {
+    // Failed to send
+  }
 }
 
-function broadcast(roomName, arr) {
+function broadcast(roomName, arr, useQueue = true) {
   if (!Array.isArray(arr)) return;
   const room = rooms.get(roomName);
   if (!room) return;
-  const payload = Buffer.from(encode(arr));
-  const framed = Buffer.concat([Buffer.from([HDR_CONTROL]), payload]);
-  for (const client of room.players.values()) {
-    if (client.readyState === WebSocket.OPEN) {
-      if (client.bufferedAmount > BUFFERED_AMOUNT_LIMIT) continue;
-      client.send(framed, { binary: true });
+  
+  try {
+    const payload = Buffer.from(encode(arr));
+    const framed = Buffer.concat([Buffer.from([HDR_CONTROL]), payload]);
+    
+    for (const client of room.players.values()) {
+      if (client.readyState !== WebSocket.OPEN) continue;
+      
+      // Use queue for guaranteed delivery
+      if (useQueue && client.state && client.state.messageQueue) {
+        // If queue has messages or buffer is high, add to queue
+        if (client.state.messageQueue.length > 0 || client.bufferedAmount > BUFFERED_AMOUNT_LIMIT) {
+          enqueueMessage(client, framed);
+        } else {
+          // Try direct send
+          try {
+            client.send(framed, { binary: true });
+          } catch (err) {
+            // If direct send fails, add to queue
+            enqueueMessage(client, framed);
+          }
+        }
+      } else {
+        // Legacy behavior without queue
+        if (client.bufferedAmount > BUFFERED_AMOUNT_LIMIT) continue;
+        try {
+          client.send(framed, { binary: true });
+        } catch (err) {
+          // Failed to send
+        }
+      }
     }
+  } catch (err) {
+    // Failed to prepare message
   }
 }
 
 // ---- connection ----
 wss.on('connection', ws => {
-  const state = { room: null, player: null, countryID: null };
+  const state = { 
+    room: null, 
+    player: null, 
+    countryID: null,
+    messageQueue: [],
+    isSending: false,
+    queueOverflowCount: 0
+  };
   ws.state = state;
 
   ws.isAlive = true;
@@ -264,12 +378,30 @@ wss.on('connection', ws => {
         }
       } catch (err) {}
     } else if (hdr === HDR_TURNCHUNK_PART) {
+      // Critical: turnchunk must be delivered to all players
       const room = rooms.get(state.room);
       if (!room) return;
+      
       for (const client of room.players.values()) {
-        if (client.readyState === WebSocket.OPEN) {
+        if (client.readyState !== WebSocket.OPEN) continue;
+        
+        // Use queue for guaranteed delivery of turnchunk
+        if (client.state && client.state.messageQueue) {
+          if (client.state.messageQueue.length > 0 || client.bufferedAmount > BUFFERED_AMOUNT_LIMIT) {
+            enqueueMessage(client, buf, true); // High priority
+          } else {
+            try {
+              client.send(buf, { binary: true });
+            } catch (err) {
+              enqueueMessage(client, buf, true);
+            }
+          }
+        } else {
+          // Legacy fallback
           if (client.bufferedAmount > BUFFERED_AMOUNT_LIMIT) continue;
-          client.send(buf, { binary: true });
+          try {
+            client.send(buf, { binary: true });
+          } catch (err) {}
         }
       }
     }
@@ -293,6 +425,15 @@ setInterval(() => {
         ws.ping();         
     });
 }, HEARTBEAT_INTERVAL);
+
+// ---- queue processor (anti-desync) ---
+setInterval(() => {
+  wss.clients.forEach(ws => {
+    if (ws.readyState === WebSocket.OPEN && ws.state && ws.state.messageQueue) {
+      processClientQueue(ws);
+    }
+  });
+}, QUEUE_PROCESS_INTERVAL);
 
 // ---- cleanup ---
 setInterval(() => {
