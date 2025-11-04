@@ -184,12 +184,11 @@ const handlers = {
   cmd: (ws, state, rest) => {
     const room = rooms.get(state.room);
     if (!room) return;
-    // CRITICAL FIX: Broadcast commands to OTHER players (exclude sender)
-    // Sender already sees their action locally, we need to notify others
+    // CRITICAL FIX: Broadcast commands to ALL players for synchronization
     if (DEBUG_LOGGING) {
-      console.log(`[CMD] From ${state.player}, broadcasting to others in ${state.room}`);
+      console.log(`[CMD] From ${state.player}, broadcasting to all in ${state.room}`);
     }
-    broadcast(state.room, ['cmd', ...rest], true, ws);
+    broadcast(state.room, ['cmd', ...rest], true);
   },
 
   getrooms: (ws) => {
@@ -342,7 +341,7 @@ function safeSend(ws, arr, useQueue = false) {
   }
 }
 
-function broadcast(roomName, arr, useQueue = true, excludeWs = null) {
+function broadcast(roomName, arr, useQueue = true) {
   if (!Array.isArray(arr)) return;
   const room = rooms.get(roomName);
   if (!room) return;
@@ -354,15 +353,8 @@ function broadcast(roomName, arr, useQueue = true, excludeWs = null) {
     let sentCount = 0;
     let queuedCount = 0;
     let failedCount = 0;
-    let excludedCount = 0;
     
     for (const client of room.players.values()) {
-      // Skip sender if excludeWs is provided
-      if (excludeWs && client === excludeWs) {
-        excludedCount++;
-        continue;
-      }
-      
       if (client.readyState !== WebSocket.OPEN) {
         failedCount++;
         continue;
@@ -407,8 +399,8 @@ function broadcast(roomName, arr, useQueue = true, excludeWs = null) {
     }
     
     // Log if there were issues with broadcast or for debug
-    if (DEBUG_LOGGING && (failedCount > 0 || excludedCount > 0)) {
-      console.log(`[BROADCAST-RESULT] Room: ${roomName}, sent=${sentCount}, queued=${queuedCount}, excluded=${excludedCount}, failed=${failedCount}`);
+    if (DEBUG_LOGGING && failedCount > 0) {
+      console.log(`[BROADCAST-RESULT] Room: ${roomName}, sent=${sentCount}, queued=${queuedCount}, failed=${failedCount}`);
     }
   } catch (err) {
     console.log(`[ERROR] Error preparing broadcast to room ${roomName}: ${err.message}`);
@@ -460,9 +452,9 @@ wss.on('connection', ws => {
           }
           if (state.room && rooms.has(state.room)) {
             if (DEBUG_LOGGING) {
-              console.log(`[BROADCAST] Type: ${type} from ${state.player} to others in room ${state.room}`);
+              console.log(`[BROADCAST] Type: ${type} from ${state.player} to all in room ${state.room}`);
             }
-            broadcast(state.room, decoded, true, ws);
+            broadcast(state.room, decoded, true);
             return;
           }
         }
@@ -470,7 +462,7 @@ wss.on('connection', ws => {
         console.log(`[ERROR] Message decode error: ${err.message}`);
       }
     } else if (hdr === HDR_TURNCHUNK_PART) {
-      // Critical: turnchunk must be delivered to OTHER players (exclude sender)
+      // Critical: turnchunk must be delivered to ALL players for synchronization
       const room = rooms.get(state.room);
       if (!room) return;
       
@@ -482,9 +474,6 @@ wss.on('connection', ws => {
       let queuedCount = 0;
       
       for (const client of room.players.values()) {
-        // Skip sender - they already have the data locally
-        if (client === ws) continue;
-        
         if (client.readyState !== WebSocket.OPEN) continue;
         
         // Use queue for guaranteed delivery of turnchunk
