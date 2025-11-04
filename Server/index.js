@@ -96,6 +96,11 @@ function handleLeave(ws, state = {}) {
 
   const wasHost = room.host === nick;
   if (room.players.delete(nick)) {
+    // Clear ready status when player leaves
+    if (room.turnReady) {
+      room.turnReady.delete(nick);
+    }
+    
     broadcast(roomName, ['l', nick]);
 
     if (room.players.size === 0) {
@@ -139,7 +144,8 @@ const handlers = {
       players,
       password: pass,
       host: nick,
-      scenarioName: "Game not started"
+      scenarioName: "Game not started",
+      turnReady: new Map() // Track who is ready for next turn
     });
 
     state.room = roomName;
@@ -186,7 +192,9 @@ const handlers = {
     if (!room) return;
     // CRITICAL FIX: Broadcast commands to ALL players for synchronization
     if (DEBUG_LOGGING) {
-      console.log(`[CMD] From ${state.player}, broadcasting to all in ${state.room}`);
+      const dataSize = rest.length;
+      const preview = dataSize > 0 ? JSON.stringify(rest.slice(0, 5)).substring(0, 100) : '[]';
+      console.log(`[CMD] From ${state.player}, room: ${state.room}, dataSize: ${dataSize}, preview: ${preview}`);
     }
     broadcast(state.room, ['cmd', ...rest], true);
   },
@@ -225,6 +233,71 @@ const handlers = {
       targetWs.state.room = null;
       targetWs.state.player = null;
       updateRoomSnapshot();
+    }
+  },
+
+  // Turn ready system - allow cancellation before all players are ready
+  turnReady: (ws, state) => {
+    const roomName = state.room;
+    const nick = state.player;
+    if (!roomName || !nick) return;
+    
+    const room = rooms.get(roomName);
+    if (!room) return;
+    
+    // Mark player as ready
+    room.turnReady.set(nick, true);
+    
+    console.log(`[TURN-READY] ${nick} is ready in ${roomName} (${room.turnReady.size}/${room.players.size})`);
+    
+    // Broadcast ready status to all players
+    const readyList = Array.from(room.turnReady.keys());
+    broadcast(roomName, ['turnReadyStatus', readyList], true);
+    
+    // Check if all players are ready
+    if (room.turnReady.size === room.players.size) {
+      console.log(`[TURN-ADVANCE] All players ready in ${roomName}, advancing turn`);
+      room.turnReady.clear();
+      // Broadcast turn advance to all
+      broadcast(roomName, ['turnAdvance'], true);
+    }
+  },
+
+  cancelTurnReady: (ws, state) => {
+    const roomName = state.room;
+    const nick = state.player;
+    if (!roomName || !nick) return;
+    
+    const room = rooms.get(roomName);
+    if (!room) return;
+    
+    // Only allow cancel if not all players are ready yet
+    if (room.turnReady.size < room.players.size) {
+      room.turnReady.delete(nick);
+      
+      console.log(`[TURN-CANCEL] ${nick} cancelled ready in ${roomName} (${room.turnReady.size}/${room.players.size})`);
+      
+      // Broadcast updated ready status
+      const readyList = Array.from(room.turnReady.keys());
+      broadcast(roomName, ['turnReadyStatus', readyList], true);
+    }
+  },
+
+  // Request game state sync (for when armies don't display)
+  requestSync: (ws, state) => {
+    const roomName = state.room;
+    const nick = state.player;
+    if (!roomName || !nick) return;
+    
+    const room = rooms.get(roomName);
+    if (!room) return;
+    
+    console.log(`[SYNC-REQUEST] ${nick} requested game state sync in ${roomName}`);
+    
+    // Ask host to send current game state to this player
+    const hostWs = room.players.get(room.host);
+    if (hostWs && hostWs.readyState === WebSocket.OPEN) {
+      safeSend(hostWs, ['syncRequest', nick], true);
     }
   }
 };
@@ -438,9 +511,10 @@ wss.on('connection', ws => {
         if (Array.isArray(decoded) && decoded.length >= 1 && typeof decoded[0] === 'string') {
           const [type, ...rest] = decoded;
           
-          // DEBUG: Log all control messages
+          // DEBUG: Log all control messages with details
           if (DEBUG_LOGGING) {
-            console.log(`[MSG] Player: ${state.player || 'unknown'}, Type: ${type}, Room: ${state.room || 'none'}`);
+            const preview = rest.length > 0 ? JSON.stringify(rest.slice(0, 3)) : '[]';
+            console.log(`[MSG] Player: ${state.player || 'unknown'}, Type: ${type}, Room: ${state.room || 'none'}, Data: ${preview}`);
           }
           
           const handler = handlers[type];
