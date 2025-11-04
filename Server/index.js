@@ -196,7 +196,23 @@ const handlers = {
       const preview = dataSize > 0 ? JSON.stringify(rest.slice(0, 5)).substring(0, 100) : '[]';
       console.log(`[CMD] From ${state.player}, room: ${state.room}, dataSize: ${dataSize}, preview: ${preview}`);
     }
+    
+    // Broadcast to ALL players
     broadcast(state.room, ['cmd', ...rest], true);
+  },
+
+  // Handle cmdi (immediate commands) - same as cmd
+  cmdi: (ws, state, rest) => {
+    const room = rooms.get(state.room);
+    if (!room) return;
+    if (DEBUG_LOGGING) {
+      const dataSize = rest.length;
+      const preview = dataSize > 0 ? JSON.stringify(rest.slice(0, 5)).substring(0, 100) : '[]';
+      console.log(`[CMDI] From ${state.player}, room: ${state.room}, dataSize: ${dataSize}, preview: ${preview}`);
+    }
+    
+    // Broadcast as cmdi to ALL players
+    broadcast(state.room, ['cmdi', ...rest], true);
   },
 
   getrooms: (ws) => {
