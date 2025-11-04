@@ -21,6 +21,15 @@ const ALLOWED_RE = /^[\p{L}\p{N}._-]+$/u;
 const rooms = new Map();
 let cachedLobbySnapshot = ['RO', []];
 
+// Statistics
+const stats = {
+  totalConnections: 0,
+  totalDisconnects: 0,
+  messagesQueued: 0,
+  messagesSent: 0,
+  queueOverflows: 0
+};
+
 const wss = new WebSocket.Server({
   port: PORT,
   perMessageDeflate: false,
@@ -98,7 +107,7 @@ function handleLeave(ws, state = {}) {
         room.host = nextHost;
         const nextWs = room.players.get(nextHost);
         if (nextWs && nextWs.readyState === WebSocket.OPEN) {
-          safeSend(nextWs, ['host']);
+          safeSend(nextWs, ['host'], true); // Use queue for critical message
         }
       }
     }
@@ -135,7 +144,7 @@ const handlers = {
     ws.state = state;
 
     updateRoomSnapshot();
-    safeSend(ws, ['roomhosted']);
+    safeSend(ws, ['roomhosted'], true); // Use queue for critical message
   },
 
   j: (ws, state, [nick, roomName, pass]) => {
@@ -172,7 +181,9 @@ const handlers = {
   cmd: (ws, state, rest) => {
     const room = rooms.get(state.room);
     if (!room) return;
-    safeSend(room.players.get(room.host), ['cmd', ...rest]);
+    // CRITICAL FIX: Broadcast commands to ALL players, not just host
+    // This ensures all players see troop movements, battles, and animations
+    broadcast(state.room, ['cmd', ...rest], true);
   },
 
   getrooms: (ws) => {
@@ -220,10 +231,11 @@ function enqueueMessage(ws, buffer, priority = false) {
   // Check queue size
   if (ws.state.messageQueue.length >= MAX_QUEUE_SIZE) {
     ws.state.queueOverflowCount = (ws.state.queueOverflowCount || 0) + 1;
+    stats.queueOverflows++;
     
     // If queue overflows too many times, disconnect the client
     if (ws.state.queueOverflowCount >= MAX_QUEUE_OVERFLOW_COUNT) {
-      console.log(`Client ${ws.state.player} disconnected due to queue overflow`);
+      console.log(`[CRITICAL] Client ${ws.state.player || 'unknown'} disconnected due to queue overflow (${ws.state.queueOverflowCount} times)`);
       handleLeave(ws, ws.state);
       ws.terminate();
       return false;
@@ -237,6 +249,8 @@ function enqueueMessage(ws, buffer, priority = false) {
   } else {
     ws.state.messageQueue.push(buffer);
   }
+  
+  stats.messagesQueued++;
   
   // Try to process queue immediately
   processClientQueue(ws);
@@ -252,19 +266,32 @@ function processClientQueue(ws) {
   // Check if we can send
   if (ws.bufferedAmount > BUFFERED_AMOUNT_LIMIT) return;
   
+  // Log if queue is getting large
+  if (ws.state.messageQueue.length > 50) {
+    console.log(`Warning: Large queue for ${ws.state.player || 'unknown'}: ${ws.state.messageQueue.length} messages`);
+  }
+  
   ws.state.isSending = true;
   
   try {
     // Send as many messages as possible
+    let sentCount = 0;
     while (ws.state.messageQueue.length > 0 && ws.bufferedAmount <= BUFFERED_AMOUNT_LIMIT) {
       const buffer = ws.state.messageQueue.shift();
       ws.send(buffer, { binary: true });
+      sentCount++;
+      stats.messagesSent++;
       
       // Reset overflow counter on successful send
       ws.state.queueOverflowCount = 0;
     }
+    
+    // Log if sent many messages at once
+    if (sentCount > 10) {
+      console.log(`Sent ${sentCount} queued messages to ${ws.state.player || 'unknown'}`);
+    }
   } catch (err) {
-    // Error sending, will retry later
+    console.log(`Error processing queue for ${ws.state.player || 'unknown'}:`, err.message);
   } finally {
     ws.state.isSending = false;
   }
@@ -291,12 +318,21 @@ function safeSend(ws, arr, useQueue = false) {
       if (useQueue && ws.state && ws.state.messageQueue) {
         return enqueueMessage(ws, framed);
       }
+      // Drop message if no queue available and buffer is full
       return;
     }
     
-    ws.send(framed, { binary: true });
+    // Try direct send
+    try {
+      ws.send(framed, { binary: true });
+    } catch (sendErr) {
+      // If direct send fails and queue is available, try queuing
+      if (useQueue && ws.state && ws.state.messageQueue) {
+        enqueueMessage(ws, framed);
+      }
+    }
   } catch (err) {
-    // Failed to send
+    console.log(`Error in safeSend: ${err.message}`);
   }
 }
 
@@ -309,52 +345,82 @@ function broadcast(roomName, arr, useQueue = true) {
     const payload = Buffer.from(encode(arr));
     const framed = Buffer.concat([Buffer.from([HDR_CONTROL]), payload]);
     
+    let sentCount = 0;
+    let queuedCount = 0;
+    let failedCount = 0;
+    
     for (const client of room.players.values()) {
-      if (client.readyState !== WebSocket.OPEN) continue;
+      if (client.readyState !== WebSocket.OPEN) {
+        failedCount++;
+        continue;
+      }
       
       // Use queue for guaranteed delivery
       if (useQueue && client.state && client.state.messageQueue) {
         // If queue has messages or buffer is high, add to queue
         if (client.state.messageQueue.length > 0 || client.bufferedAmount > BUFFERED_AMOUNT_LIMIT) {
-          enqueueMessage(client, framed);
+          if (enqueueMessage(client, framed)) {
+            queuedCount++;
+          } else {
+            failedCount++;
+          }
         } else {
           // Try direct send
           try {
             client.send(framed, { binary: true });
+            sentCount++;
           } catch (err) {
             // If direct send fails, add to queue
-            enqueueMessage(client, framed);
+            if (enqueueMessage(client, framed)) {
+              queuedCount++;
+            } else {
+              failedCount++;
+            }
           }
         }
       } else {
         // Legacy behavior without queue
-        if (client.bufferedAmount > BUFFERED_AMOUNT_LIMIT) continue;
+        if (client.bufferedAmount > BUFFERED_AMOUNT_LIMIT) {
+          failedCount++;
+          continue;
+        }
         try {
           client.send(framed, { binary: true });
+          sentCount++;
         } catch (err) {
-          // Failed to send
+          failedCount++;
         }
       }
     }
+    
+    // Log if there were issues with broadcast
+    if (failedCount > 0) {
+      console.log(`Broadcast to room ${roomName}: sent=${sentCount}, queued=${queuedCount}, failed=${failedCount}`);
+    }
   } catch (err) {
-    // Failed to prepare message
+    console.log(`Error preparing broadcast to room ${roomName}: ${err.message}`);
   }
 }
 
 // ---- connection ----
 wss.on('connection', ws => {
+  stats.totalConnections++;
+  
   const state = { 
     room: null, 
     player: null, 
     countryID: null,
     messageQueue: [],
     isSending: false,
-    queueOverflowCount: 0
+    queueOverflowCount: 0,
+    connectedAt: Date.now()
   };
   ws.state = state;
 
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
+  
+  console.log(`[INFO] New connection (total: ${stats.totalConnections}, active: ${wss.clients.size})`);
 
   ws.on('message', (data, isBinary) => {
     const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
@@ -407,8 +473,16 @@ wss.on('connection', ws => {
     }
   });
 
-  ws.on('close', () => handleLeave(ws, state));
+  ws.on('close', () => {
+    stats.totalDisconnects++;
+    const duration = Date.now() - (state.connectedAt || 0);
+    console.log(`[INFO] Client disconnected (player: ${state.player || 'unknown'}, duration: ${Math.floor(duration / 1000)}s, active: ${wss.clients.size - 1})`);
+    handleLeave(ws, state);
+  });
+  
   ws.on('error', err => {
+    stats.totalDisconnects++;
+    console.log(`[ERROR] Client error (player: ${state.player || 'unknown'}): ${err.message}`);
     handleLeave(ws, state);
   });
 });
@@ -453,6 +527,23 @@ setInterval(() => {
   } catch (err) {}
 }, EMPTY_ROOM_CHECK_INTERVAL);
 
-wss.on('close', () => clearInterval(interval));
+// ---- statistics logger ---
+setInterval(() => {
+  const queueSizes = [];
+  wss.clients.forEach(ws => {
+    if (ws.state && ws.state.messageQueue) {
+      queueSizes.push(ws.state.messageQueue.length);
+    }
+  });
+  
+  const avgQueueSize = queueSizes.length > 0 ? Math.round(queueSizes.reduce((a, b) => a + b, 0) / queueSizes.length) : 0;
+  const maxQueueSize = queueSizes.length > 0 ? Math.max(...queueSizes) : 0;
+  
+  console.log(`[STATS] Active: ${wss.clients.size}, Rooms: ${rooms.size}, ` +
+              `Queued: ${stats.messagesQueued}, Sent: ${stats.messagesSent}, ` +
+              `Overflows: ${stats.queueOverflows}, AvgQueue: ${avgQueueSize}, MaxQueue: ${maxQueueSize}`);
+}, 60 * 1000); // Every minute
 
 updateRoomSnapshot();
+
+console.log('[INFO] Server initialized and ready');
